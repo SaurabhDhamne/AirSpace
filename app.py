@@ -14,7 +14,7 @@ from streamlit_webrtc import webrtc_streamer, WebRtcMode, RTCConfiguration
 # PAGE CONFIG
 # ===============================
 st.set_page_config(page_title="AirSpace Web", layout="wide")
-st.title("✨ AirSpace - Gesture Drawing (Web Demo)")
+st.title("✨ AirSpace - Gesture Drawing (Optimized Web Demo)")
 st.markdown("Control the canvas using hand gestures.")
 
 # ===============================
@@ -27,8 +27,8 @@ color_option = st.sidebar.selectbox(
     ["Purple", "Red", "Blue", "Green"]
 )
 
-brush_thickness = st.sidebar.slider("Brush Thickness", 1, 20, 6)
-eraser_thickness = st.sidebar.slider("Eraser Size", 10, 80, 40)
+brush_thickness = st.sidebar.slider("Brush Thickness", 1, 15, 5)
+eraser_thickness = st.sidebar.slider("Eraser Size", 10, 60, 30)
 
 color_map = {
     "Purple": (147, 20, 255),
@@ -40,7 +40,7 @@ color_map = {
 draw_color = color_map[color_option]
 
 # ===============================
-# DOWNLOAD MEDIAPIPE MODEL
+# DOWNLOAD MODEL ONCE
 # ===============================
 MODEL_PATH = "hand_landmarker.task"
 
@@ -53,13 +53,18 @@ HandLandmarker = vision.HandLandmarker
 HandLandmarkerOptions = vision.HandLandmarkerOptions
 VisionRunningMode = vision.RunningMode
 
-options = HandLandmarkerOptions(
-    base_options=BaseOptions(model_asset_path=MODEL_PATH),
-    running_mode=VisionRunningMode.IMAGE,
-    num_hands=1
-)
 
-landmarker = HandLandmarker.create_from_options(options)
+@st.cache_resource
+def load_model():
+    options = HandLandmarkerOptions(
+        base_options=BaseOptions(model_asset_path=MODEL_PATH),
+        running_mode=VisionRunningMode.IMAGE,
+        num_hands=1
+    )
+    return HandLandmarker.create_from_options(options)
+
+
+landmarker = load_model()
 
 # ===============================
 # VIDEO PROCESSOR
@@ -73,6 +78,10 @@ class VideoProcessor:
     def recv(self, frame):
         img = frame.to_ndarray(format="bgr24")
         img = cv2.flip(img, 1)
+
+        # 🔥 Reduce resolution for memory saving
+        img = cv2.resize(img, (480, 360))
+
         h, w, _ = img.shape
 
         if self.canvas is None or self.canvas.shape != img.shape:
@@ -94,7 +103,6 @@ class VideoProcessor:
             for id, lm in enumerate(hand_lms):
                 cx, cy = int(lm.x * w), int(lm.y * h)
                 lm_list.append([id, cx, cy])
-                cv2.circle(img, (cx, cy), 5, (0, 255, 0), -1)
 
             if len(lm_list) != 0:
                 x, y = lm_list[8][1], lm_list[8][2]
@@ -102,23 +110,17 @@ class VideoProcessor:
                 fingers = []
 
                 # Thumb
-                if lm_list[4][1] > lm_list[3][1]:
-                    fingers.append(1)
-                else:
-                    fingers.append(0)
+                fingers.append(1 if lm_list[4][1] > lm_list[3][1] else 0)
 
                 # Other fingers
                 for fid in [8, 12, 16, 20]:
-                    if lm_list[fid][2] < lm_list[fid - 2][2]:
-                        fingers.append(1)
-                    else:
-                        fingers.append(0)
+                    fingers.append(
+                        1 if lm_list[fid][2] < lm_list[fid - 2][2] else 0
+                    )
 
                 total_fingers = fingers.count(1)
 
-                # ===============================
-                # DRAW MODE (Index only)
-                # ===============================
+                # DRAW
                 if fingers[1] == 1 and total_fingers == 1:
                     if self.prev_x is None:
                         self.prev_x, self.prev_y = x, y
@@ -132,9 +134,7 @@ class VideoProcessor:
                     )
                     self.prev_x, self.prev_y = x, y
 
-                # ===============================
-                # ERASE MODE (Index + Middle)
-                # ===============================
+                # ERASE
                 elif fingers[1] == 1 and fingers[2] == 1 and total_fingers == 2:
                     cv2.circle(
                         self.canvas,
@@ -148,9 +148,7 @@ class VideoProcessor:
                 else:
                     self.prev_x, self.prev_y = None, None
 
-        # ===============================
-        # MERGE CANVAS
-        # ===============================
+        # Merge canvas
         img_gray = cv2.cvtColor(self.canvas, cv2.COLOR_BGR2GRAY)
         _, img_inv = cv2.threshold(img_gray, 50, 255, cv2.THRESH_BINARY_INV)
         img_inv = cv2.cvtColor(img_inv, cv2.COLOR_GRAY2BGR)
@@ -159,11 +157,17 @@ class VideoProcessor:
 
         return av.VideoFrame.from_ndarray(img, format="bgr24")
 
+
 # ===============================
-# BUTTON CONTROLS
+# BUTTONS
 # ===============================
-start = st.button("🚀 Start Camera")
-clear = st.button("🧹 Clear Canvas")
+col1, col2 = st.columns(2)
+
+with col1:
+    start = st.button("🚀 Start Camera")
+
+with col2:
+    stop = st.button("⛔ Stop Camera")
 
 if "run" not in st.session_state:
     st.session_state.run = False
@@ -171,16 +175,29 @@ if "run" not in st.session_state:
 if start:
     st.session_state.run = True
 
-if clear:
+if stop:
     st.session_state.run = False
     st.experimental_rerun()
 
 # ===============================
-# WEBRTC STREAM
+# WEBRTC
 # ===============================
 if st.session_state.run:
     rtc_configuration = RTCConfiguration(
-        {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
+        {
+            "iceServers": [
+                {"urls": ["stun:stun.l.google.com:19302"]},
+                {
+                    "urls": [
+                        "turn:openrelay.metered.ca:80",
+                        "turn:openrelay.metered.ca:443",
+                        "turn:openrelay.metered.ca:443?transport=tcp",
+                    ],
+                    "username": "openrelayproject",
+                    "credential": "openrelayproject",
+                },
+            ]
+        }
     )
 
     webrtc_streamer(
@@ -188,7 +205,10 @@ if st.session_state.run:
         mode=WebRtcMode.SENDRECV,
         rtc_configuration=rtc_configuration,
         video_processor_factory=VideoProcessor,
-        media_stream_constraints={"video": True, "audio": False},
+        media_stream_constraints={
+            "video": {"frameRate": 15},
+            "audio": False
+        },
         async_processing=True,
     )
 
