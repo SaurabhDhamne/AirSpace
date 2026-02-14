@@ -3,6 +3,11 @@ import numpy as np
 import av
 import mediapipe as mp
 import streamlit as st
+import os
+import urllib.request
+
+from mediapipe.tasks import python
+from mediapipe.tasks.python import vision
 from streamlit_webrtc import webrtc_streamer, WebRtcMode, RTCConfiguration
 
 # ===============================
@@ -10,7 +15,6 @@ from streamlit_webrtc import webrtc_streamer, WebRtcMode, RTCConfiguration
 # ===============================
 st.set_page_config(page_title="AirSpace Web", layout="wide")
 st.title("✨ AirSpace - Gesture Drawing (Web Demo)")
-
 st.markdown("Control the canvas using hand gestures.")
 
 # ===============================
@@ -36,15 +40,26 @@ color_map = {
 draw_color = color_map[color_option]
 
 # ===============================
-# MEDIAPIPE SETUP
+# DOWNLOAD MEDIAPIPE MODEL
 # ===============================
-mp_hands = mp.solutions.hands
-hands = mp_hands.Hands(
-    min_detection_confidence=0.7,
-    min_tracking_confidence=0.7,
-    max_num_hands=1
+MODEL_PATH = "hand_landmarker.task"
+
+if not os.path.exists(MODEL_PATH):
+    url = "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task"
+    urllib.request.urlretrieve(url, MODEL_PATH)
+
+BaseOptions = python.BaseOptions
+HandLandmarker = vision.HandLandmarker
+HandLandmarkerOptions = vision.HandLandmarkerOptions
+VisionRunningMode = vision.RunningMode
+
+options = HandLandmarkerOptions(
+    base_options=BaseOptions(model_asset_path=MODEL_PATH),
+    running_mode=VisionRunningMode.IMAGE,
+    num_hands=1
 )
-mp_draw = mp.solutions.drawing_utils
+
+landmarker = HandLandmarker.create_from_options(options)
 
 # ===============================
 # VIDEO PROCESSOR
@@ -64,68 +79,74 @@ class VideoProcessor:
             self.canvas = np.zeros((h, w, 3), dtype=np.uint8)
 
         img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        result = hands.process(img_rgb)
 
-        if result.multi_hand_landmarks:
-            for hand_lms in result.multi_hand_landmarks:
-                mp_draw.draw_landmarks(img, hand_lms, mp_hands.HAND_CONNECTIONS)
+        mp_image = mp.Image(
+            image_format=mp.ImageFormat.SRGB,
+            data=img_rgb
+        )
 
-                lm_list = []
-                for id, lm in enumerate(hand_lms.landmark):
-                    cx, cy = int(lm.x * w), int(lm.y * h)
-                    lm_list.append([id, cx, cy])
+        result = landmarker.detect(mp_image)
 
-                if len(lm_list) != 0:
-                    x, y = lm_list[8][1], lm_list[8][2]
+        if result.hand_landmarks:
+            hand_lms = result.hand_landmarks[0]
 
-                    fingers = []
+            lm_list = []
+            for id, lm in enumerate(hand_lms):
+                cx, cy = int(lm.x * w), int(lm.y * h)
+                lm_list.append([id, cx, cy])
+                cv2.circle(img, (cx, cy), 5, (0, 255, 0), -1)
 
-                    # Thumb (compare x coordinates correctly)
-                    if lm_list[4][1] > lm_list[3][1]:
+            if len(lm_list) != 0:
+                x, y = lm_list[8][1], lm_list[8][2]
+
+                fingers = []
+
+                # Thumb
+                if lm_list[4][1] > lm_list[3][1]:
+                    fingers.append(1)
+                else:
+                    fingers.append(0)
+
+                # Other fingers
+                for fid in [8, 12, 16, 20]:
+                    if lm_list[fid][2] < lm_list[fid - 2][2]:
                         fingers.append(1)
                     else:
                         fingers.append(0)
 
-                    # Other fingers
-                    for id in [8, 12, 16, 20]:
-                        if lm_list[id][2] < lm_list[id - 2][2]:
-                            fingers.append(1)
-                        else:
-                            fingers.append(0)
+                total_fingers = fingers.count(1)
 
-                    total_fingers = fingers.count(1)
-
-                    # ===============================
-                    # DRAW MODE (Index only)
-                    # ===============================
-                    if fingers[1] == 1 and total_fingers == 1:
-                        if self.prev_x is None:
-                            self.prev_x, self.prev_y = x, y
-
-                        cv2.line(
-                            self.canvas,
-                            (self.prev_x, self.prev_y),
-                            (x, y),
-                            draw_color,
-                            brush_thickness
-                        )
+                # ===============================
+                # DRAW MODE (Index only)
+                # ===============================
+                if fingers[1] == 1 and total_fingers == 1:
+                    if self.prev_x is None:
                         self.prev_x, self.prev_y = x, y
 
-                    # ===============================
-                    # ERASE MODE (Index + Middle)
-                    # ===============================
-                    elif fingers[1] == 1 and fingers[2] == 1 and total_fingers == 2:
-                        cv2.circle(
-                            self.canvas,
-                            (x, y),
-                            eraser_thickness,
-                            (0, 0, 0),
-                            -1
-                        )
-                        self.prev_x, self.prev_y = None, None
+                    cv2.line(
+                        self.canvas,
+                        (self.prev_x, self.prev_y),
+                        (x, y),
+                        draw_color,
+                        brush_thickness
+                    )
+                    self.prev_x, self.prev_y = x, y
 
-                    else:
-                        self.prev_x, self.prev_y = None, None
+                # ===============================
+                # ERASE MODE (Index + Middle)
+                # ===============================
+                elif fingers[1] == 1 and fingers[2] == 1 and total_fingers == 2:
+                    cv2.circle(
+                        self.canvas,
+                        (x, y),
+                        eraser_thickness,
+                        (0, 0, 0),
+                        -1
+                    )
+                    self.prev_x, self.prev_y = None, None
+
+                else:
+                    self.prev_x, self.prev_y = None, None
 
         # ===============================
         # MERGE CANVAS
