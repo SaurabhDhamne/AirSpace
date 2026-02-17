@@ -1,215 +1,248 @@
 import cv2
 import numpy as np
-import av
 import mediapipe as mp
-import streamlit as st
-import os
-import urllib.request
+import pytesseract
+import time
+import re
+import webbrowser  # <--- Add this
+import os          # <--- Add this (for opening apps like calculator)
+# If needed on Windows:
+# pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 
-from mediapipe.tasks import python
-from mediapipe.tasks.python import vision
-from streamlit_webrtc import webrtc_streamer, WebRtcMode, RTCConfiguration
+print("----------------------------------------")
+print("           AIRSPACE CONTROLS")
+print("---------------------------------------")
+print("☝️  Index Finger:      DRAW")
+print("✌️  Index + Middle:    ERASE")
+print("✊  Fist:              HOVER")
+print("👍  Thumb Up:          OCR Scan")
+print("✋  Open Palm:         Unlock OCR")
+print("Press Q or ESC to Exit")
+print("---------------------------------------")
 
 # ===============================
-# PAGE CONFIG
+# Mediapipe Setup
 # ===============================
-st.set_page_config(page_title="AirSpace Web", layout="wide")
-st.title("✨ AirSpace - Gesture Drawing (Optimized Web Demo)")
-st.markdown("Control the canvas using hand gestures.")
-
-# ===============================
-# SIDEBAR CONTROLS
-# ===============================
-st.sidebar.header("🎨 Brush Settings")
-
-color_option = st.sidebar.selectbox(
-    "Select Brush Color",
-    ["Purple", "Red", "Blue", "Green"]
+mp_hands = mp.solutions.hands
+hands = mp_hands.Hands(
+    min_detection_confidence=0.7,
+    min_tracking_confidence=0.7,
+    max_num_hands=1
 )
-
-brush_thickness = st.sidebar.slider("Brush Thickness", 1, 15, 5)
-eraser_thickness = st.sidebar.slider("Eraser Size", 10, 60, 30)
-
-color_map = {
-    "Purple": (147, 20, 255),
-    "Red": (0, 0, 255),
-    "Blue": (255, 0, 0),
-    "Green": (0, 255, 0),
-}
-
-draw_color = color_map[color_option]
+mp_draw = mp.solutions.drawing_utils
 
 # ===============================
-# DOWNLOAD MODEL ONCE
+# Camera Setup
 # ===============================
-MODEL_PATH = "hand_landmarker.task"
-
-if not os.path.exists(MODEL_PATH):
-    url = "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task"
-    urllib.request.urlretrieve(url, MODEL_PATH)
-
-BaseOptions = python.BaseOptions
-HandLandmarker = vision.HandLandmarker
-HandLandmarkerOptions = vision.HandLandmarkerOptions
-VisionRunningMode = vision.RunningMode
-
-
-@st.cache_resource
-def load_model():
-    options = HandLandmarkerOptions(
-        base_options=BaseOptions(model_asset_path=MODEL_PATH),
-        running_mode=VisionRunningMode.IMAGE,
-        num_hands=1
-    )
-    return HandLandmarker.create_from_options(options)
-
-
-landmarker = load_model()
+cap = cv2.VideoCapture(0)
+ret, frame = cap.read()
+h, w, _ = frame.shape
+canvas = np.zeros((h, w, 3), dtype=np.uint8)
 
 # ===============================
-# VIDEO PROCESSOR
+# Drawing Variables
 # ===============================
-class VideoProcessor:
-    def __init__(self):
-        self.canvas = None
-        self.prev_x = None
-        self.prev_y = None
+prev_x, prev_y = None, None
+draw_color = (147, 20, 255)
+eraser_color = (0, 0, 0)
+thickness = 6
+eraser_thickness = 40
 
-    def recv(self, frame):
-        img = frame.to_ndarray(format="bgr24")
-        img = cv2.flip(img, 1)
+# ===============================
+# OCR Control
+# ===============================
+ocr_locked = False
+last_ocr_time = 0
+cooldown = 2
 
-        # 🔥 Reduce resolution for memory saving
-        img = cv2.resize(img, (480, 360))
+# ===============================
+# Finger Detection
+# ===============================
+def get_finger_status(hand_landmarks):
+    tips = [8, 12, 16, 20]
+    fingers = []
 
-        h, w, _ = img.shape
+    # Thumb
+    if hand_landmarks.landmark[4].x < hand_landmarks.landmark[3].x:
+        fingers.append(1)
+    else:
+        fingers.append(0)
 
-        if self.canvas is None or self.canvas.shape != img.shape:
-            self.canvas = np.zeros((h, w, 3), dtype=np.uint8)
+    # Other fingers
+    for tip in tips:
+        if hand_landmarks.landmark[tip].y < hand_landmarks.landmark[tip - 2].y:
+            fingers.append(1)
+        else:
+            fingers.append(0)
 
-        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    return fingers  # [thumb, index, middle, ring, pinky]
 
-        mp_image = mp.Image(
-            image_format=mp.ImageFormat.SRGB,
-            data=img_rgb
-        )
+# ===============================
+# Main Loop
+# ===============================
+while True:
+    ret, frame = cap.read()
+    if not ret:
+        break
 
-        result = landmarker.detect(mp_image)
+    frame = cv2.flip(frame, 1)
+    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    result = hands.process(rgb)
 
-        if result.hand_landmarks:
-            hand_lms = result.hand_landmarks[0]
+    if not result.multi_hand_landmarks:
+        prev_x, prev_y = None, None
 
-            lm_list = []
-            for id, lm in enumerate(hand_lms):
-                cx, cy = int(lm.x * w), int(lm.y * h)
-                lm_list.append([id, cx, cy])
+    if result.multi_hand_landmarks:
+        for hand_landmarks in result.multi_hand_landmarks:
 
-            if len(lm_list) != 0:
-                x, y = lm_list[8][1], lm_list[8][2]
+            mp_draw.draw_landmarks(frame, hand_landmarks,
+                                   mp_hands.HAND_CONNECTIONS)
 
-                fingers = []
+            fingers = get_finger_status(hand_landmarks)
 
-                # Thumb
-                fingers.append(1 if lm_list[4][1] > lm_list[3][1] else 0)
+            x = int(hand_landmarks.landmark[8].x * w)
+            y = int(hand_landmarks.landmark[8].y * h)
 
-                # Other fingers
-                for fid in [8, 12, 16, 20]:
-                    fingers.append(
-                        1 if lm_list[fid][2] < lm_list[fid - 2][2] else 0
+            # ===============================
+            # DRAW ☝️
+            # ===============================
+            if fingers[1] == 1 and fingers[2] == 0 and sum(fingers) == 1:
+                cv2.putText(frame, "DRAW MODE", (10, 40),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 255), 3)
+
+                if prev_x is None:
+                    prev_x, prev_y = x, y
+
+                cv2.line(canvas, (prev_x, prev_y), (x, y),
+                         draw_color, thickness)
+
+                prev_x, prev_y = x, y
+
+            # ===============================
+            # OCR 👍
+            # ===============================
+            elif fingers[0] == 1 and sum(fingers) == 1:
+
+                current_time = time.time()
+
+                if not ocr_locked and (current_time - last_ocr_time > cooldown):
+
+                    cv2.putText(frame, "OCR SCANNING", (10, 40),
+                                cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 3)
+
+                    gray = cv2.cvtColor(canvas, cv2.COLOR_BGR2GRAY)
+                    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+
+                    thresh = cv2.adaptiveThreshold(
+                        blur, 255,
+                        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                        cv2.THRESH_BINARY_INV,
+                        11, 2
                     )
 
-                total_fingers = fingers.count(1)
+                    kernel = np.ones((3, 3), np.uint8)
+                    processed = cv2.dilate(thresh, kernel, iterations=1)
 
-                # DRAW
-                if fingers[1] == 1 and total_fingers == 1:
-                    if self.prev_x is None:
-                        self.prev_x, self.prev_y = x, y
+                    cv2.imshow("OCR Preview", processed)
 
-                    cv2.line(
-                        self.canvas,
-                        (self.prev_x, self.prev_y),
-                        (x, y),
-                        draw_color,
-                        brush_thickness
-                    )
-                    self.prev_x, self.prev_y = x, y
+                    custom_config = r'--oem 3 --psm 6'
+                    text = pytesseract.image_to_string(
+                        processed, config=custom_config)
 
-                # ERASE
-                elif fingers[1] == 1 and fingers[2] == 1 and total_fingers == 2:
-                    cv2.circle(
-                        self.canvas,
-                        (x, y),
-                        eraser_thickness,
-                        (0, 0, 0),
-                        -1
-                    )
-                    self.prev_x, self.prev_y = None, None
+                    text = text.strip().upper()
+                    print("OCR Raw Output:", text)
+
+                    if text != "":
+
+                        if "CAL" in text:
+                            cv2.putText(frame, "OPENING CALCULATOR...", (50, 200), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+                            print("🚀 Action: Opening Calculator")
+                            os.system('calc')
+                            ocr_locked = True
+                            ast_ocr_time = current_time
+
+                        elif "GG" in text:
+                            cv2.putText(frame, "OPENING GOOGLE...", (50, 200), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+                            print("🚀 Action: Opening Google")
+                            webbrowser.open("https://www.google.com")
+                            ocr_locked = True
+                            ast_ocr_time = current_time
+                        elif "YOU" in text:
+                            webbrowser.open("https://www.youtube.com")  
+                        elif "MOM" in text:
+                            webbrowser.open("https://wa.me/7276773021")
+                            print("🚀 Action: Chating with MOM")
+
+
+                        elif "R" in text:
+                            draw_color = (0, 0, 255)
+                            print("Red color brush!")  
+                        elif "B" in text:
+                            draw_color = (255, 0, 0 )
+                        elif "P" in text:
+                            draw_color = (0,255,255)    
+
+
+                        ocr_locked = True
+                        last_ocr_time = current_time
+
+                        canvas = np.zeros((h, w, 3), dtype=np.uint8)
 
                 else:
-                    self.prev_x, self.prev_y = None, None
+                    cv2.putText(frame, "OCR LOCKED", (10, 40),
+                                cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 3)
 
-        # Merge canvas
-        img_gray = cv2.cvtColor(self.canvas, cv2.COLOR_BGR2GRAY)
-        _, img_inv = cv2.threshold(img_gray, 50, 255, cv2.THRESH_BINARY_INV)
-        img_inv = cv2.cvtColor(img_inv, cv2.COLOR_GRAY2BGR)
-        img = cv2.bitwise_and(img, img_inv)
-        img = cv2.bitwise_or(img, self.canvas)
+                prev_x, prev_y = None, None
 
-        return av.VideoFrame.from_ndarray(img, format="bgr24")
+            # ===============================
+            # UNLOCK ✋ (All fingers up)
+            # ===============================
+            elif sum(fingers) == 5:
+                cv2.putText(frame, "OCR UNLOCKED", (10, 40),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 0), 3)
 
+                ocr_locked = False
+                prev_x, prev_y = None, None
 
-# ===============================
-# BUTTONS
-# ===============================
-col1, col2 = st.columns(2)
+            # ===============================
+            # ERASE ✌️
+            # ===============================
+            elif fingers[1] == 1 and fingers[2] == 1 and sum(fingers) == 2:
+                cv2.putText(frame, "ERASE MODE", (10, 40),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 3)
 
-with col1:
-    start = st.button("🚀 Start Camera")
+                cv2.circle(canvas, (x, y),
+                           eraser_thickness, eraser_color, -1)
 
-with col2:
-    stop = st.button("⛔ Stop Camera")
+                prev_x, prev_y = None, None
 
-if "run" not in st.session_state:
-    st.session_state.run = False
+            # ===============================
+            # HOVER ✊
+            # ===============================
+            elif sum(fingers) == 0:
+                cv2.putText(frame, "HOVER MODE", (10, 40),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 3)
 
-if start:
-    st.session_state.run = True
+                prev_x, prev_y = None, None
 
-if stop:
-    st.session_state.run = False
-    st.experimental_rerun()
+            else:
+                prev_x, prev_y = None, None
 
-# ===============================
-# WEBRTC
-# ===============================
-if st.session_state.run:
-    rtc_configuration = RTCConfiguration(
-        {
-            "iceServers": [
-                {"urls": ["stun:stun.l.google.com:19302"]},
-                {
-                    "urls": [
-                        "turn:openrelay.metered.ca:80",
-                        "turn:openrelay.metered.ca:443",
-                        "turn:openrelay.metered.ca:443?transport=tcp",
-                    ],
-                    "username": "openrelayproject",
-                    "credential": "openrelayproject",
-                },
-            ]
-        }
-    )
+    # ===============================
+    # Merge Canvas
+    # ===============================
+    gray_canvas = cv2.cvtColor(canvas, cv2.COLOR_BGR2GRAY)
+    _, inv = cv2.threshold(gray_canvas, 20, 255, cv2.THRESH_BINARY_INV)
+    inv = cv2.cvtColor(inv, cv2.COLOR_GRAY2BGR)
 
-    webrtc_streamer(
-        key="airspace",
-        mode=WebRtcMode.SENDRECV,
-        rtc_configuration=rtc_configuration,
-        video_processor_factory=VideoProcessor,
-        media_stream_constraints={
-            "video": {"frameRate": 15},
-            "audio": False
-        },
-        async_processing=True,
-    )
+    frame = cv2.bitwise_and(frame, inv)
+    frame = cv2.bitwise_or(frame, canvas)
 
-st.info("☝️ Index = Draw | ✌️ Index+Middle = Erase")
+    cv2.imshow("Airspace Controls", frame)
+
+    key = cv2.waitKey(1) & 0xFF
+    if key == ord('q') or key == 27:
+        break
+
+cap.release()
+cv2.destroyAllWindows()
